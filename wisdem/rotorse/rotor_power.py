@@ -7,11 +7,11 @@ January 2020
 
 import logging
 
-import numpy as np
 from openmdao.api import Group, ExplicitComponent
 from scipy.optimize import brentq, minimize, minimize_scalar
 from scipy.interpolate import PchipInterpolator
 
+import numpy as np
 from wisdem.ccblade.Polar import Polar
 from wisdem.ccblade.ccblade import CCBlade, CCAirfoil
 from wisdem.commonse.utilities import smooth_abs, smooth_min, linspace_with_deriv
@@ -77,6 +77,7 @@ class RotorPower(Group):
 
         # Connections to the gust calculation
         self.connect("powercurve.rated_V", "gust.V_hub")
+        self.connect("powercurve.U_shift","gust.U_shift")
 
         # Connections to the Weibull CDF
         self.connect("powercurve.V_spline", "cdf.x")
@@ -91,12 +92,13 @@ class GustETM(ExplicitComponent):
 
     def initialize(self):
         # number of standard deviations for strength of gust
-        self.options.declare("std", default=3.0)
+        self.options.declare("std", default=0.0)
 
     def setup(self):
         # Inputs
         self.add_input("V_mean", val=0.0, units="m/s", desc="IEC average wind speed for turbine class")
         self.add_input("V_hub", val=0.0, units="m/s", desc="hub height wind speed")
+        self.add_input("U_shift", val=0.0, units="m/s", desc="wind speed where max RBM reached")
         self.add_discrete_input("turbulence_class", val="A", desc="IEC turbulence class")
 
         # Output
@@ -105,6 +107,7 @@ class GustETM(ExplicitComponent):
     def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
         V_mean = inputs["V_mean"]
         V_hub = inputs["V_hub"]
+        U_shift = inputs["U_shift"]
         std = self.options["std"]
         turbulence_class = discrete_inputs["turbulence_class"]
 
@@ -119,7 +122,7 @@ class GustETM(ExplicitComponent):
 
         c = 2.0
         sigma = c * Iref * (0.072 * (V_mean / c + 3) * (V_hub / c - 4) + 10)
-        V_gust = V_hub + std * sigma
+        V_gust = U_shift  #V_hub + std * sigma
         outputs["V_gust"] = V_gust
 
 
@@ -251,8 +254,11 @@ class ComputePowerCurve(ExplicitComponent):
 
         self.add_output("V_R25", val=0.0, units="m/s", desc="region 2.5 transition wind speed")
         self.add_output("rated_V", val=0.0, units="m/s", desc="rated wind speed")
+        self.add_output("U_shift", val=0.0, units="m/s", desc="wind speed where max RBM reached")
         self.add_output("rated_Omega", val=0.0, units="rpm", desc="rotor rotation speed at rated")
+        self.add_output("Omega_shift", val=0.0, units="rpm", desc="rotor rotation speed at U_shift")
         self.add_output("rated_pitch", val=0.0, units="deg", desc="pitch setting at rated")
+        self.add_output("pitch_opt", val=0.0, units="deg", desc="pitch setting at U_shift")
         self.add_output("rated_T", val=0.0, units="N", desc="rotor aerodynamic thrust at rated")
         self.add_output("rated_Q", val=0.0, units="N*m", desc="rotor aerodynamic torque at rated")
         self.add_output("rated_mech", val=0.0, units="W", desc="Mechanical shaft power at rated")
@@ -377,7 +383,9 @@ class ComputePowerCurve(ExplicitComponent):
         # for the hub
         grid0 = np.cumsum(np.abs(np.diff(np.cos(np.linspace(-np.pi / 4.0, np.pi / 2.0, self.n_pc)))))
         grid1 = (grid0 - grid0[0]) / (grid0[-1] - grid0[0])
-        Uhub = grid1 * (inputs["v_max"] - inputs["v_min"]) + inputs["v_min"]
+        #Uhub = np.array([3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10, 10.5, 13, 17, 25]) #grid1 * (inputs["v_max"] - inputs["v_min"]) + inputs["v_min"]
+        Uhub = np.hstack((np.arange(3,7.0,0.5),np.arange(6.6,7.5,0.1),np.arange(7.6,11.2,0.2),np.arange(13,27,2)))  #6.1,11.1,0.1
+        delta_tsr = 2 # difference between the two operational TSR
 
         P_aero = np.zeros(Uhub.shape)
         Cp_aero = np.zeros(Uhub.shape)
@@ -389,13 +397,29 @@ class ComputePowerCurve(ExplicitComponent):
         T = np.zeros(Uhub.shape)
         Q = np.zeros(Uhub.shape)
         M = np.zeros(Uhub.shape)
-        pitch = np.zeros(Uhub.shape) + inputs["control_pitch"]
+        #pitch = np.zeros(Uhub.shape) - 1.0 #+ inputs["control_pitch"]
 
         # Unpack variables
         P_rated = float(inputs["rated_power"])
         R_tip = float(inputs["Rtip"])
         tsr = float(inputs["tsr_operational"])
         driveType = discrete_inputs["drivetrainType"]
+        
+        #find pitch for maximum power @TSR 11 (save pitch_opt as pitch_load?)
+        def maximizePower(pitch_i, Uhub_i, Omega_rpm_i):
+            myout, _ = self.ccblade.evaluate([Uhub_i], [Omega_rpm_i], [pitch_i], coefficients=False)
+            return -myout["P"] * 1e-6
+        
+        U_ref = 10.0
+        Omega_ref = tsr * U_ref / R_tip * 60 / (2*np.pi) #maybe replace with TSR and Rtip
+        bnds = [-10.0, 10.0]
+        pitch_opt = minimize_scalar(
+            lambda x: maximizePower(x, U_ref, Omega_ref),
+            bounds=bnds,
+            method="bounded",
+            options={"disp": False, "xatol": TOL, "maxiter": 40},
+        )["x"]
+        pitch = np.zeros(Uhub.shape) + pitch_opt
 
         ## POWERCURVE PRELIMS ##
         # Set rotor speed based on TSR
@@ -406,8 +430,8 @@ class ComputePowerCurve(ExplicitComponent):
 
         # Apply maximum and minimum rotor speed limits
         Omega_min = inputs["omega_min"] * np.pi / 30.0
-        Omega = np.maximum(np.minimum(Omega_tsr, Omega_max), Omega_min)
-        Omega_rpm = Omega * 30.0 / np.pi
+        Omega = np.maximum(np.minimum(Omega_tsr, Omega_max), Omega_min) #np.array([2.64,2.64,2.64,2.9,3.22,3.55,3.87,4.19,4.39,4.39,4.39,4.49,4.75,5.01,5.22,5.22,5.22,5.22,5.22]) * np.pi / 30.0
+        Omega_rpm = Omega * 30.0 / np.pi #np.array([2.64,2.64,2.64,2.9,3.22,3.55,3.87,4.19,4.39,4.39,4.39,4.49,4.75,5.01,5.22,5.22,5.22,5.22,5.22])
 
         # Create table lookup of total drivetrain efficiency, where rpm is first column and second column is gearbox*generator
         lss_rpm = inputs["lss_rpm"]
@@ -424,9 +448,9 @@ class ComputePowerCurve(ExplicitComponent):
 
         # driveEta  = np.c_[lss_rpm, float(inputs['gearbox_efficiency'])*gen_eff]
         driveEta = float(inputs["gearbox_efficiency"]) * gen_eff
-
+        
         # Set baseline power production
-        myout, derivs = self.ccblade.evaluate(Uhub, Omega_tsr * 30.0 / np.pi, pitch, coefficients=True)
+        myout, derivs = self.ccblade.evaluate(Uhub, Omega_rpm, pitch, coefficients=True)
         P_aero, T, Q, M, Cp_aero, Ct_aero, Cq_aero, Cm_aero = [
             myout[key] for key in ["P", "T", "Q", "Mb", "CP", "CT", "CQ", "CMb"]
         ]
@@ -455,7 +479,7 @@ class ComputePowerCurve(ExplicitComponent):
         region2p5 = U_2p5 < U_rated
 
         # Initialize peak shaving thrust value, will be updated later
-        max_T = self.thrust_shaving_coeff * T.max() if self.peak_thrust_shaving and found_rated else 1e16
+        max_M = self.thrust_shaving_coeff if self.peak_thrust_shaving and found_rated else 1e16 #self.thrust_shaving_coeff * M.max()
 
         ## REGION II.5 and RATED ##
         # Solve for rated velocity
@@ -465,7 +489,7 @@ class ComputePowerCurve(ExplicitComponent):
             def const_Urated(x):
                 pitch_i = x[0]
                 Uhub_i = x[1]
-                Omega_i = min([Uhub_i * tsr / R_tip, Omega_max])
+                Omega_i = min([Uhub_i * (tsr - delta_tsr) / R_tip, Omega_max])
                 Omega_i_rpm = Omega_i * 30.0 / np.pi
                 myout, _ = self.ccblade.evaluate([Uhub_i], [Omega_i_rpm], [pitch_i], coefficients=False)
                 P_aero_i = float(myout["P"])
@@ -483,22 +507,20 @@ class ComputePowerCurve(ExplicitComponent):
                 const = {}
                 const["type"] = "eq"
                 const["fun"] = const_Urated
-                params_rated = minimize(
-                    lambda x: x[1], x0, method="slsqp", bounds=bnds, constraints=const, tol=TOL, options={"disp": False}
-                )
+                params_rated = minimize(lambda x: x[1], x0, method="slsqp", bounds=bnds, constraints=const, tol=TOL)
 
                 if params_rated.success and not np.isnan(params_rated.x[1]):
                     U_rated = params_rated.x[1]
-                    pitch_rated = params_rated.x[0]
+                    pitch_rated = params_rated.x[0] 
                 else:
                     U_rated = U_rated  # Use guessed value earlier
-                    pitch_rated = 0.0
+                    pitch_rated = 0.0 
             else:
                 # Just search over speed
                 pitch_rated = 0.0
                 try:
                     U_rated = brentq(
-                        lambda x: const_Urated([0.0, x]),
+                        lambda x: const_Urated([0.0, x]), 
                         Uhub[i - 2],
                         Uhub[i + 2],
                         xtol=1e-1 * TOL,
@@ -514,7 +536,7 @@ class ComputePowerCurve(ExplicitComponent):
                         options={"disp": False, "xatol": TOL, "maxiter": 40},
                     )["x"]
 
-            Omega_tsr_rated = U_rated * tsr / R_tip
+            Omega_tsr_rated = U_rated * (tsr - delta_tsr) / R_tip
             Omega_rated = np.minimum(Omega_tsr_rated, Omega_max)
             Omega_rpm_rated = Omega_rated * 30.0 / np.pi
             myout, _ = self.ccblade.evaluate([U_rated], [Omega_rpm_rated], [pitch_rated], coefficients=True)
@@ -534,20 +556,20 @@ class ComputePowerCurve(ExplicitComponent):
 
             ## REGION II.5 and RATED with peak shaving##
             if self.peak_thrust_shaving:
-                max_T = self.thrust_shaving_coeff * T_rated
+                max_M = self.thrust_shaving_coeff #self.thrust_shaving_coeff * M_rated
 
                 def const_Urated_Tpeak(x):
                     pitch_i = x[0]
                     Uhub_i = x[1]
-                    Omega_i = min([Uhub_i * tsr / R_tip, Omega_max])
+                    Omega_i = min([Uhub_i * (tsr - delta_tsr) / R_tip, Omega_max])
                     Omega_i_rpm = Omega_i * 30.0 / np.pi
                     myout, _ = self.ccblade.evaluate([Uhub_i], [Omega_i_rpm], [pitch_i], coefficients=False)
                     P_aero_i = float(myout["P"])
                     # P_i,_  = compute_P_and_eff(P_aero_i.flatten(), P_rated, Omega_i_rpm, driveType, driveEta)
                     eff_i = np.interp(Omega_i_rpm, lss_rpm, driveEta)
                     P_i = float(P_aero_i * eff_i)
-                    T_i = float(myout["T"])
-                    return 1e-4 * (P_i - P_rated), 1e-4 * (T_i - max_T)
+                    M_i = float(myout["Mb"])
+                    return 1e-4 * (P_i - P_rated), 1e-4 * (M_i - max_M)
 
                 # Have to search over both pitch and speed
                 x0 = [0.0, U_rated]
@@ -555,18 +577,16 @@ class ComputePowerCurve(ExplicitComponent):
                 const = {}
                 const["type"] = "eq"
                 const["fun"] = const_Urated_Tpeak
-                params_rated = minimize(
-                    lambda x: x[1], x0, method="slsqp", bounds=bnds, constraints=const, tol=TOL, options={"disp": False}
-                )
+                params_rated = minimize(lambda x: x[1], x0, method="slsqp", bounds=bnds, constraints=const, tol=TOL)
 
                 if params_rated.success and not np.isnan(params_rated.x[1]):
                     U_rated = params_rated.x[1]
-                    pitch_rated = params_rated.x[0]
+                    pitch_rated = params_rated.x[0] 
                 else:
                     U_rated = U_rated  # Use guessed value earlier
-                    pitch_rated = 0.0
+                    pitch_rated = 0.0 
 
-                Omega_tsr_rated = U_rated * tsr / R_tip
+                Omega_tsr_rated = U_rated * (tsr - delta_tsr) / R_tip
                 Omega_rated = np.minimum(Omega_tsr_rated, Omega_max)
                 Omega_rpm_rated = Omega_rated * 30.0 / np.pi
                 myout, _ = self.ccblade.evaluate([U_rated], [Omega_rpm_rated], [pitch_rated], coefficients=True)
@@ -604,14 +624,14 @@ class ComputePowerCurve(ExplicitComponent):
             eff_rated = eff[-1]
 
         # Store rated speed in array
-        Uhub = np.r_[Uhub, U_rated]
+        Uhub = np.r_[Uhub, U_rated] #edit by DR
         isort = np.argsort(Uhub)
         Uhub = Uhub[isort]
 
-        Omega_tsr = np.r_[Omega_tsr, Omega_tsr_rated][isort]
-        Omega = np.r_[Omega, Omega_rated][isort]
-        Omega_rpm = np.r_[Omega_rpm, Omega_rpm_rated][isort]
-        pitch = np.r_[pitch, pitch_rated][isort]
+        Omega_tsr = np.r_[Omega_tsr, Omega_tsr_rated][isort] #edit by DR
+        Omega = np.r_[Omega, Omega_rated][isort] #edit by DR
+        Omega_rpm = np.r_[Omega_rpm, Omega_rpm_rated][isort] #edit by DR
+        pitch = np.r_[pitch, pitch_rated][isort] #edit by DR
         P_aero = np.r_[P_aero, P_aero_rated][isort]
         P = np.r_[P, P_rated][isort]
         T = np.r_[T, T_rated][isort]
@@ -622,24 +642,57 @@ class ComputePowerCurve(ExplicitComponent):
         Ct_aero = np.r_[Ct_aero, Ct_aero_rated][isort]
         Cq_aero = np.r_[Cq_aero, Cq_aero_rated][isort]
         Cm_aero = np.r_[Cm_aero, Cm_aero_rated][isort]
-        eff = np.r_[eff, eff_rated][isort]
+        eff = np.r_[eff, eff_rated][isort] #edit by DR
 
         i_rated = np.where(Uhub == U_rated)[0][0]
         i_3 = np.minimum(i_rated + 1, self.n_pc)
 
         # Set rated conditions for rest of powercurve
-        Omega[i_rated:] = Omega_rated  # Stay at this speed if hit rated too early
-        Omega_rpm = Omega * 30.0 / np.pi
+        Omega[i_rated:] = Omega_rated  # Stay at this speed if hit rated too early #edit by DR
+        Omega_rpm = Omega * 30.0 / np.pi #edit by DR
 
         ## REGION II ##
-        # Functions to be used inside of power maximization until Region 3
-        def maximizePower(pitch_i, Uhub_i, Omega_rpm_i):
-            myout, _ = self.ccblade.evaluate([Uhub_i], [Omega_rpm_i], [pitch_i], coefficients=False)
-            return -myout["P"] * 1e-6
-
+        # Functions to be used inside of power maximization until Region 3        
         def constr_Tmax(pitch_i, Uhub_i, Omega_rpm_i):
             myout, _ = self.ccblade.evaluate([Uhub_i], [Omega_rpm_i], [pitch_i], coefficients=False)
-            return 1e-5 * (max_T - float(myout["T"]))
+            return 1e-5 * (max_M - float(myout["Mb"]))
+
+        #edit by DR: adjust rpm schedule (lower TSR when max loads are reached)              
+        #find highest Uhub for TSR11 and pitch_opt where still M < max_M --> that's i_shift
+        U_start = 7.0
+        i_search = abs(Uhub - U_start).argmin()
+        continue_search = True
+        iteration = -1
+        while continue_search:
+            iteration = iteration + 1
+            myout, _ = self.ccblade.evaluate([Uhub[i_search]], [Omega_rpm[i_search]], [pitch_opt], coefficients=False)
+            M_tmp = float(myout["Mb"])
+            if iteration == 0:
+                if M_tmp < max_M:
+                    max_M_pointer = False 
+                else: 
+                    max_M_pointer = True
+            if M_tmp < max_M and not max_M_pointer: 
+                i_search = i_search + 1
+            elif M_tmp >= max_M and not max_M_pointer:
+                i_shift = i_search - 1
+                continue_search = False
+            elif M_tmp >= max_M and max_M_pointer:
+                i_search = i_search - 1
+            elif M_tmp < max_M and max_M_pointer:
+                i_shift = i_search
+                continue_search = False
+        U_shift = Uhub[i_shift]
+        
+        #adjust Omega for Uhub > U_shift (transition to TSR9) until rated
+        U_shiftEnd = Omega[i_shift] * R_tip / (tsr - delta_tsr)
+        i_shiftEnd = np.where((Uhub - U_shiftEnd) < 0, (Uhub - U_shiftEnd), -np.inf).argmax()
+        Omega[i_shift+1:i_shiftEnd+1] = Omega[i_shift]
+        Omega_tmp = Omega.copy()
+        Omega_tmp[i_shiftEnd+1:] = (tsr - delta_tsr) * Uhub[i_shiftEnd+1:] / R_tip
+        Omega = np.minimum(Omega_tmp, Omega)
+        Omega_rpm = Omega / (2*np.pi) * 60
+        Omega_shift = Omega_rpm[i_shift]
 
         # Maximize power until rated
         for i in range(i_3):
@@ -647,7 +700,7 @@ class ComputePowerCurve(ExplicitComponent):
             # fix_pitch_regI12, which locks pitch in region I 1/2, is on
             if (
                 ((Omega[i] == Omega_tsr[i]) and not self.peak_thrust_shaving)
-                or ((Omega[i] == Omega_tsr[i]) and self.peak_thrust_shaving and (T[i] <= max_T))
+                or ((Omega[i] == Omega_tsr[i]) and self.peak_thrust_shaving and (M[i] <= max_M))
                 or ((Omega[i] == Omega_min) and self.fix_pitch_regI12)
                 or (found_rated and (i == i_rated))
             ):
@@ -657,7 +710,7 @@ class ComputePowerCurve(ExplicitComponent):
             pitch0 = pitch[i] if i == 0 else pitch[i - 1]
             bnds = [pitch0 - 10.0, pitch0 + 10.0]
             if self.peak_thrust_shaving and found_rated:
-                # Have to constrain thrust
+                # Have to constrain thrust (or RBM)
                 const = {}
                 const["type"] = "ineq"
                 const["fun"] = lambda x: constr_Tmax(x, Uhub[i], Omega_rpm[i])
@@ -668,11 +721,11 @@ class ComputePowerCurve(ExplicitComponent):
                     bounds=[bnds],
                     constraints=const,
                     tol=TOL,
-                    options={"maxiter": 20, "disp": False},  #'catol':0.01*max_T},
+                    options={"maxiter": 20},  #'catol':0.01*max_M},
                 )
-                pitch[i] = params.x[0]
-            else:
-                # Only adjust pitch
+                pitch[i] = params.x[0] 
+            else:        
+                #Only adjust pitch
                 pitch[i] = minimize_scalar(
                     lambda x: maximizePower(x, Uhub[i], Omega_rpm[i]),
                     bounds=bnds,
@@ -735,7 +788,7 @@ class ComputePowerCurve(ExplicitComponent):
                     # P[i]        = P_rated
 
                     # If we are thrust shaving, then check if this is a point that must be modified
-                    if self.peak_thrust_shaving and T[i] >= max_T:
+                    if self.peak_thrust_shaving and M[i] >= max_M:
                         const = {}
                         const["type"] = "ineq"
                         const["fun"] = lambda x: constr_Tmax(x, Uhub[i], Omega_rpm[i])
@@ -743,10 +796,9 @@ class ComputePowerCurve(ExplicitComponent):
                             lambda x: np.abs(rated_power_dist(x, Uhub[i], Omega_rpm[i])),
                             pitch0,
                             method="slsqp",
-                            bounds=bnds,
+                            bounds=[bnds],
                             constraints=const,
                             tol=TOL,
-                            options={"disp": False},
                         )
                         if params.success and not np.isnan(params.x[0]):
                             pitch[i] = params.x[0]
@@ -767,12 +819,12 @@ class ComputePowerCurve(ExplicitComponent):
                 Q[i_3:] = P[i_3:] / Omega[i_3:]
                 M[i_3:] = 0
                 pitch[i_3:] = 0
-                Cp[i_3:] = P[i_3:] / (0.5 * inputs["rho"] * np.pi * R_tip**2 * Uhub[i_3:] ** 3)
-                Cp_aero[i_3:] = P_aero[i_3:] / (0.5 * inputs["rho"] * np.pi * R_tip**2 * Uhub[i_3:] ** 3)
+                Cp[i_3:] = P[i_3:] / (0.5 * inputs["rho"] * np.pi * R_tip ** 2 * Uhub[i_3:] ** 3)
+                Cp_aero[i_3:] = P_aero[i_3:] / (0.5 * inputs["rho"] * np.pi * R_tip ** 2 * Uhub[i_3:] ** 3)
                 Ct_aero[i_3:] = 0
                 Cq_aero[i_3:] = 0
                 Cm_aero[i_3:] = 0
-
+        
         ## END POWERCURVE ##
 
         # Store outputs
@@ -792,15 +844,18 @@ class ComputePowerCurve(ExplicitComponent):
         outputs["pitch"] = pitch
 
         outputs["rated_V"] = np.float_(U_rated)
+        outputs["U_shift"] = np.float_(U_shift)
         outputs["rated_Omega"] = Omega_rpm_rated
+        outputs["Omega_shift"] = Omega_shift
         outputs["rated_pitch"] = pitch_rated
+        outputs["pitch_opt"] = pitch_opt
         outputs["rated_T"] = T_rated
         outputs["rated_Q"] = Q_rated
         outputs["rated_mech"] = P_aero_rated
         outputs["rated_efficiency"] = eff_rated
 
         self.ccblade.induction_inflow = True
-        tsr_vec = Omega_rpm / 30.0 * np.pi * R_tip / Uhub
+        tsr_vec = Omega_rpm / 30.0 * np.pi * R_tip / Uhub #DR: check which operational point is calculated
         id_regII = np.argmin(abs(tsr_vec - inputs["tsr_operational"]))
         loads, derivs = self.ccblade.distributedAeroLoads(Uhub[id_regII], Omega_rpm[id_regII], pitch[id_regII], 0.0)
 
@@ -873,9 +928,11 @@ class ComputeSplines(ExplicitComponent):
 # Class to define a constraint so that the blade cannot operate in stall conditions
 class NoStallConstraint(ExplicitComponent):
     def initialize(self):
+
         self.options.declare("modeling_options")
 
     def setup(self):
+
         modeling_options = self.options["modeling_options"]
         self.n_span = n_span = modeling_options["WISDEM"]["RotorSE"]["n_span"]
         self.n_aoa = n_aoa = modeling_options["WISDEM"]["RotorSE"]["n_aoa"]  # Number of angle of attacks
@@ -911,6 +968,7 @@ class NoStallConstraint(ExplicitComponent):
         )
 
     def compute(self, inputs, outputs):
+
         i_min = np.argmin(abs(inputs["min_s"] - inputs["s"]))
 
         for i in range(self.n_span):
@@ -939,6 +997,7 @@ class NoStallConstraint(ExplicitComponent):
 
 class AEP(ExplicitComponent):
     def initialize(self):
+
         self.options.declare("nspline")
 
     def setup(self):
@@ -963,6 +1022,7 @@ class AEP(ExplicitComponent):
         # self.declare_partials('*', '*', method='fd', form='central', step=1e-6)
 
     def compute(self, inputs, outputs):
+
         lossFactor = inputs["lossFactor"]
         P = inputs["P"]
         CDF_V = inputs["CDF_V"]
@@ -986,6 +1046,7 @@ class AEP(ExplicitComponent):
 
 
 def compute_P_and_eff(aeroPower, ratedPower, Omega_rpm, drivetrainType, drivetrainEff):
+
     if not np.any(drivetrainEff):
         drivetrainType = drivetrainType.upper()
         if drivetrainType == "GEARED":
@@ -1046,7 +1107,7 @@ def eval_unsteady(alpha, cl, cd, cm):
     unsteady["alpha0"] = alpha0
     unsteady["alpha1"] = alpha1
     unsteady["alpha2"] = alpha2
-    unsteady["Cd0"] = 0.0
+    unsteady["Cd0"] = 0.
     unsteady["Cm0"] = cm0
     unsteady["Cn1"] = cn1
     unsteady["Cn2"] = cn2

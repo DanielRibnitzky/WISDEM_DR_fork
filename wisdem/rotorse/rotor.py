@@ -157,10 +157,9 @@ class RotorSE(om.Group):
 
         # Connection from ra to rs for the rated conditions
         self.connect("rp.gust.V_gust", ["rs.aero_gust.V_load", "rs.aero_hub_loads.V_load"])
-        self.connect(
-            "rp.powercurve.rated_Omega", ["rs.Omega_load", "rs.tot_loads_gust.aeroloads_Omega", "rs.constr.rated_Omega"]
-        )
-        self.connect("rp.powercurve.rated_pitch", ["rs.pitch_load", "rs.tot_loads_gust.aeroloads_pitch"])
+        self.connect("rp.powercurve.Omega_shift", ["rs.Omega_load", "rs.tot_loads_gust.aeroloads_Omega"])
+        self.connect("rp.powercurve.rated_Omega", "rs.constr.rated_Omega")
+        self.connect("rp.powercurve.pitch_opt", ["rs.pitch_load", "rs.tot_loads_gust.aeroloads_pitch"]) #initially: "rp.powercurve.rated_pitch"
 
         # Connections to RotorPower
         self.connect("wt_class.V_mean", "rp.cdf.xbar")
